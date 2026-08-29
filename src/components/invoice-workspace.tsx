@@ -10,6 +10,8 @@ import {
   History,
   ImageIcon,
   LoaderCircle,
+  LogIn,
+  LogOut,
   ReceiptText,
   RotateCcw,
   ScanLine,
@@ -18,12 +20,16 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { AuthDialog } from "@/components/auth-dialog";
+import { logoutAction } from "@/lib/actions/auth";
 import type {
   InvoiceRecord,
   InvoiceRecordSummary,
   JsonObject,
   RecognizeResult,
+  SessionUser,
 } from "@/lib/types";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -324,7 +330,8 @@ function InvoiceResult({ result }: { result: RecognizeResult }) {
   );
 }
 
-export function InvoiceWorkspace() {
+export function InvoiceWorkspace({ user }: { user: SessionUser | null }) {
+  const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [pageNo, setPageNo] = useState(1);
@@ -334,6 +341,27 @@ export function InvoiceWorkspace() {
   const [history, setHistory] = useState<InvoiceRecordSummary[]>([]);
   const [historyLoadingId, setHistoryLoadingId] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [authOpen, setAuthOpen] = useState(false);
+  /** 「开始识别」触发登录时置为 true，登录成功后自动续跑这次识别。 */
+  const pendingRecognizeRef = useRef(false);
+
+  const closeAuth = useCallback(() => {
+    pendingRecognizeRef.current = false;
+    setAuthOpen(false);
+  }, []);
+
+  /** 登录成功：关掉弹窗并刷新服务端会话状态。 */
+  const handleAuthSuccess = useCallback(() => {
+    setAuthOpen(false);
+    router.refresh();
+  }, [router]);
+
+  /** 会话失效时弹出登录框；返回 true 表示调用方应停止后续处理。 */
+  const handleUnauthorized = useCallback((response: Response) => {
+    if (response.status !== 401) return false;
+    setAuthOpen(true);
+    return true;
+  }, []);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -347,6 +375,8 @@ export function InvoiceWorkspace() {
   }, []);
 
   useEffect(() => {
+    // 未登录时不请求历史记录，避免无谓的 401。
+    if (!user) return;
     let active = true;
     fetch("/api/records?limit=10", { cache: "no-store" })
       .then((response) => (response.ok ? response.json() : null))
@@ -357,7 +387,7 @@ export function InvoiceWorkspace() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [user]);
 
   const previewUrl = useMemo(() => {
     if (!file || !file.type.startsWith("image/")) return null;
@@ -389,7 +419,7 @@ export function InvoiceWorkspace() {
     setStatus("ready");
   }, []);
 
-  async function submit() {
+  const recognize = useCallback(async () => {
     if (!file || status === "loading") return;
     setStatus("loading");
     setError("");
@@ -400,6 +430,7 @@ export function InvoiceWorkspace() {
 
     try {
       const response = await fetch("/api/recognize", { method: "POST", body });
+      if (handleUnauthorized(response)) return;
       const payload = (await response.json()) as RecognizeResult & { error?: string };
       if (!response.ok) throw new Error(payload.error || "识别失败，请稍后重试。");
       setResult(payload);
@@ -410,7 +441,23 @@ export function InvoiceWorkspace() {
       setStatus("error");
       await loadHistory();
     }
+  }, [file, pageNo, status, handleUnauthorized, loadHistory]);
+
+  function submit() {
+    // 未登录时先弹出登录框，登录成功后再自动续跑这次识别。
+    if (!user) {
+      pendingRecognizeRef.current = true;
+      setAuthOpen(true);
+      return;
+    }
+    void recognize();
   }
+
+  useEffect(() => {
+    if (!user || !pendingRecognizeRef.current) return;
+    pendingRecognizeRef.current = false;
+    void recognize();
+  }, [user, recognize]);
 
   async function openHistory(id: string) {
     setHistoryLoadingId(id);
@@ -419,6 +466,7 @@ export function InvoiceWorkspace() {
       const response = await fetch(`/api/records/${encodeURIComponent(id)}`, {
         cache: "no-store",
       });
+      if (handleUnauthorized(response)) return;
       const record = (await response.json()) as InvoiceRecord & { error?: string };
       if (!response.ok || !record.data || !record.rawResponse) {
         throw new Error(record.error || "该记录没有可展示的识别结果。");
@@ -465,9 +513,38 @@ export function InvoiceWorkspace() {
               <div className="text-[11px] text-[#758086]">阿里云 OCR 发票识别</div>
             </div>
           </div>
-          <div className="flex items-center gap-2 text-xs text-[#667177]">
-            <ShieldCheck className="h-4 w-4 text-[#087f72]" />
-            文件不留存
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 text-xs text-[#667177]">
+              <ShieldCheck className="h-4 w-4 text-[#087f72]" />
+              文件不留存
+            </div>
+            <div className="h-6 w-px bg-[#d9dfe2]" />
+            {user ? (
+              <div className="flex items-center gap-3">
+                <div className="text-right leading-4">
+                  <div className="text-xs font-medium text-[#263236]">{user.displayName}</div>
+                  <div className="text-[11px] text-[#758086]">{user.email}</div>
+                </div>
+                <form action={logoutAction}>
+                  <button
+                    type="submit"
+                    className="flex items-center gap-1 border border-[#d9dfe2] px-2.5 py-1.5 text-xs text-[#667177] transition-colors hover:border-[#087f72] hover:text-[#087f72]"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    退出
+                  </button>
+                </form>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="flex items-center gap-1 border border-[#d9dfe2] px-2.5 py-1.5 text-xs text-[#667177] transition-colors hover:border-[#087f72] hover:text-[#087f72]"
+                onClick={() => setAuthOpen(true)}
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                登录
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -679,7 +756,7 @@ export function InvoiceWorkspace() {
               </div>
               {history.length === 0 ? (
                 <div className="border border-dashed border-[#d1d8db] px-4 py-5 text-center text-xs text-[#879196]">
-                  暂无识别记录
+                  {user ? "暂无识别记录" : "登录后可查看自己的识别记录"}
                 </div>
               ) : (
                 <div className="divide-y divide-[#e2e6e8] border-y border-[#d9dfe2]">
@@ -723,6 +800,8 @@ export function InvoiceWorkspace() {
           </section>
         </div>
       </main>
+
+      {authOpen && <AuthDialog onClose={closeAuth} onSuccess={handleAuthSuccess} />}
     </div>
   );
 }
